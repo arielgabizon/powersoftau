@@ -1,19 +1,13 @@
-extern crate pairing;
-extern crate powersoftau;
-extern crate rand;
-extern crate blake2;
-extern crate byteorder;
-extern crate bellman;
-
-use bellman::pairing::{CurveAffine, CurveProjective};
-use bellman::pairing::bls12_381::{G1, G2};
-use powersoftau::*;
-
-use bellman::multicore::Worker;
 use bellman::domain::{EvaluationDomain, Point};
+use bellman::multicore::Worker;
+use groupy::{CurveAffine, CurveProjective};
+use paired::bls12_381::{Bls12, G1, G2};
+use powersoftau::{accumulator::*, keypair::*, parameters::*, utils::*};
 
 use std::fs::OpenOptions;
 use std::io::{self, BufReader, BufWriter, Write};
+
+use powersoftau::small_bls12_381::Bls12CeremonyParameters;
 
 fn into_hex(h: &[u8]) -> String {
     let mut f = String::new();
@@ -28,81 +22,65 @@ fn into_hex(h: &[u8]) -> String {
 // Computes the hash of the challenge file for the player,
 // given the current state of the accumulator and the last
 // response file hash.
-fn get_challenge_file_hash(
-    acc: &Accumulator,
-    last_response_file_hash: &[u8; 64]
-) -> [u8; 64]
-{
+fn get_challenge_file_hash<P: PowersOfTauParameters>(
+    acc: &Accumulator<Bls12, P>,
+    last_response_file_hash: &[u8; 64],
+) -> [u8; 64] {
     let sink = io::sink();
     let mut sink = HashWriter::new(sink);
 
-    sink.write_all(last_response_file_hash)
-        .unwrap();
+    sink.write_all(last_response_file_hash).unwrap();
 
-    acc.serialize(
-        &mut sink,
-        UseCompression::No
-    ).unwrap();
+    acc.serialize(&mut sink, UseCompression::No).unwrap();
 
-    let mut tmp = [0; 64];
-    tmp.copy_from_slice(sink.into_hash().as_slice());
-
-    tmp
+    sink.into_hash()
 }
 
 // Computes the hash of the response file, given the new
 // accumulator, the player's public key, and the challenge
 // file's hash.
-fn get_response_file_hash(
-    acc: &Accumulator,
-    pubkey: &PublicKey,
-    last_challenge_file_hash: &[u8; 64]
-) -> [u8; 64]
-{
+fn get_response_file_hash<P: PowersOfTauParameters>(
+    acc: &Accumulator<Bls12, P>,
+    pubkey: &PublicKey<Bls12>,
+    last_challenge_file_hash: &[u8; 64],
+) -> [u8; 64] {
     let sink = io::sink();
     let mut sink = HashWriter::new(sink);
 
-    sink.write_all(last_challenge_file_hash)
-        .unwrap();
+    sink.write_all(last_challenge_file_hash).unwrap();
 
-    acc.serialize(
-        &mut sink,
-        UseCompression::Yes
-    ).unwrap();
+    acc.serialize(&mut sink, UseCompression::Yes).unwrap();
 
     pubkey.serialize(&mut sink).unwrap();
 
-    let mut tmp = [0; 64];
-    tmp.copy_from_slice(sink.into_hash().as_slice());
-
-    tmp
+    sink.into_hash()
 }
 
 fn main() {
     // Try to load `./transcript` from disk.
     let reader = OpenOptions::new()
-                            .read(true)
-                            .open("transcript")
-                            .expect("unable open `./transcript` in this directory");
+        .read(true)
+        .open("transcript")
+        .expect("unable open `./transcript` in this directory");
 
     let mut reader = BufReader::with_capacity(1024 * 1024, reader);
 
+    let parameters = Bls12CeremonyParameters {};
+
     // Initialize the accumulator
-    let mut current_accumulator = Accumulator::new();
+    let mut current_accumulator = Accumulator::new(parameters.clone());
 
     // The "last response file hash" is just a blank BLAKE2b hash
     // at the beginning of the hash chain.
     let mut last_response_file_hash = [0; 64];
-    last_response_file_hash.copy_from_slice(blank_hash().as_slice());
+    last_response_file_hash.copy_from_slice(&blank_hash());
 
     // There were 89 rounds.
     for _ in 0..89 {
         // Compute the hash of the challenge file that the player
         // should have received.
-        let last_challenge_file_hash = get_challenge_file_hash(
-            &current_accumulator,
-            &last_response_file_hash
-        );
+        let last_challenge_file_hash =
+            get_challenge_file_hash(&current_accumulator, &last_response_file_hash);
 
         // Deserialize the accumulator provided by the player in
         // their response file. It's stored in the transcript in
@@ -111,8 +89,10 @@ fn main() {
         let response_file_accumulator = Accumulator::deserialize(
             &mut reader,
             UseCompression::No,
-            CheckForCorrectness::Yes
-        ).expect("unable to read uncompressed accumulator");
+            CheckForCorrectness::Yes,
+            parameters.clone(),
+        )
+        .expect("unable to read uncompressed accumulator");
 
         // Deserialize the public key provided by the player.
         let response_file_pubkey = PublicKey::deserialize(&mut reader)
@@ -124,7 +104,7 @@ fn main() {
         last_response_file_hash = get_response_file_hash(
             &response_file_accumulator,
             &response_file_pubkey,
-            &last_challenge_file_hash
+            &last_challenge_file_hash,
         );
 
         print!("{}", into_hex(&last_response_file_hash));
@@ -136,9 +116,8 @@ fn main() {
             &current_accumulator,
             &response_file_accumulator,
             &response_file_pubkey,
-            &last_challenge_file_hash
-        )
-        {
+            &last_challenge_file_hash,
+        ) {
             println!(" ... FAILED");
             panic!("INVALID RESPONSE FILE!");
         } else {
@@ -153,42 +132,50 @@ fn main() {
     let worker = &Worker::new();
 
     // Create the parameters for various 2^m circuit depths.
-    for m in 0..22 {
+    for m in 0..30 {
         let paramname = format!("phase1radix2m{}", m);
         println!("Creating {}", paramname);
 
         let degree = 1 << m;
 
         let mut g1_coeffs = EvaluationDomain::from_coeffs(
-            current_accumulator.tau_powers_g1[0..degree].iter()
+            current_accumulator.tau_powers_g1[0..degree]
+                .iter()
                 .map(|e| Point(e.into_projective()))
-                .collect()
-        ).unwrap();
+                .collect(),
+        )
+        .unwrap();
 
         let mut g2_coeffs = EvaluationDomain::from_coeffs(
-            current_accumulator.tau_powers_g2[0..degree].iter()
+            current_accumulator.tau_powers_g2[0..degree]
+                .iter()
                 .map(|e| Point(e.into_projective()))
-                .collect()
-        ).unwrap();
+                .collect(),
+        )
+        .unwrap();
 
         let mut g1_alpha_coeffs = EvaluationDomain::from_coeffs(
-            current_accumulator.alpha_tau_powers_g1[0..degree].iter()
+            current_accumulator.alpha_tau_powers_g1[0..degree]
+                .iter()
                 .map(|e| Point(e.into_projective()))
-                .collect()
-        ).unwrap();
-        
+                .collect(),
+        )
+        .unwrap();
+
         let mut g1_beta_coeffs = EvaluationDomain::from_coeffs(
-            current_accumulator.beta_tau_powers_g1[0..degree].iter()
+            current_accumulator.beta_tau_powers_g1[0..degree]
+                .iter()
                 .map(|e| Point(e.into_projective()))
-                .collect()
-        ).unwrap();
+                .collect(),
+        )
+        .unwrap();
 
         // This converts all of the elements into Lagrange coefficients
         // for later construction of interpolation polynomials
-        g1_coeffs.ifft(&worker);
-        g2_coeffs.ifft(&worker);
-        g1_alpha_coeffs.ifft(&worker);
-        g1_beta_coeffs.ifft(&worker);
+        g1_coeffs.ifft(&worker, &mut None).unwrap();
+        g2_coeffs.ifft(&worker, &mut None).unwrap();
+        g1_alpha_coeffs.ifft(&worker, &mut None).unwrap();
+        g1_beta_coeffs.ifft(&worker, &mut None).unwrap();
 
         let g1_coeffs = g1_coeffs.into_coeffs();
         let g2_coeffs = g2_coeffs.into_coeffs();
@@ -202,21 +189,13 @@ fn main() {
 
         // Remove the Point() wrappers
 
-        let mut g1_coeffs = g1_coeffs.into_iter()
-            .map(|e| e.0)
-            .collect::<Vec<_>>();
+        let mut g1_coeffs = g1_coeffs.into_iter().map(|e| e.0).collect::<Vec<_>>();
 
-        let mut g2_coeffs = g2_coeffs.into_iter()
-            .map(|e| e.0)
-            .collect::<Vec<_>>();
+        let mut g2_coeffs = g2_coeffs.into_iter().map(|e| e.0).collect::<Vec<_>>();
 
-        let mut g1_alpha_coeffs = g1_alpha_coeffs.into_iter()
-            .map(|e| e.0)
-            .collect::<Vec<_>>();
+        let mut g1_alpha_coeffs = g1_alpha_coeffs.into_iter().map(|e| e.0).collect::<Vec<_>>();
 
-        let mut g1_beta_coeffs = g1_beta_coeffs.into_iter()
-            .map(|e| e.0)
-            .collect::<Vec<_>>();
+        let mut g1_beta_coeffs = g1_beta_coeffs.into_iter().map(|e| e.0).collect::<Vec<_>>();
 
         // Batch normalize
         G1::batch_normalization(&mut g1_coeffs);
@@ -229,7 +208,7 @@ fn main() {
         // x^(i + m) - x^i for i in 0..=(m-2)
         // for radix2 evaluation domains
         let mut h = Vec::with_capacity(degree - 1);
-        for i in 0..(degree-1) {
+        for i in 0..(degree - 1) {
             let mut tmp = current_accumulator.tau_powers_g1[i + degree].into_projective();
             let mut tmp2 = current_accumulator.tau_powers_g1[i].into_projective();
             tmp2.negate();
@@ -243,39 +222,41 @@ fn main() {
 
         // Create the parameter file
         let writer = OpenOptions::new()
-                            .read(false)
-                            .write(true)
-                            .create_new(true)
-                            .open(paramname)
-                            .expect("unable to create parameter file in this directory");
+            .read(false)
+            .write(true)
+            .create_new(true)
+            .open(paramname)
+            .expect("unable to create parameter file in this directory");
 
         let mut writer = BufWriter::new(writer);
 
         // Write alpha (in g1)
         // Needed by verifier for e(alpha, beta)
         // Needed by prover for A and C elements of proof
-        writer.write_all(
-            current_accumulator.alpha_tau_powers_g1[0]
-                .into_uncompressed()
-                .as_ref()
-        ).unwrap();
+        writer
+            .write_all(
+                current_accumulator.alpha_tau_powers_g1[0]
+                    .into_uncompressed()
+                    .as_ref(),
+            )
+            .unwrap();
 
         // Write beta (in g1)
         // Needed by prover for C element of proof
-        writer.write_all(
-            current_accumulator.beta_tau_powers_g1[0]
-                .into_uncompressed()
-                .as_ref()
-        ).unwrap();
+        writer
+            .write_all(
+                current_accumulator.beta_tau_powers_g1[0]
+                    .into_uncompressed()
+                    .as_ref(),
+            )
+            .unwrap();
 
         // Write beta (in g2)
         // Needed by verifier for e(alpha, beta)
         // Needed by prover for B element of proof
-        writer.write_all(
-            current_accumulator.beta_g2
-                .into_uncompressed()
-                .as_ref()
-        ).unwrap();
+        writer
+            .write_all(current_accumulator.beta_g2.into_uncompressed().as_ref())
+            .unwrap();
 
         // Lagrange coefficients in G1 (for constructing
         // LC/IC queries and precomputing polynomials for A)
@@ -283,10 +264,9 @@ fn main() {
             // Was normalized earlier in parallel
             let coeff = coeff.into_affine();
 
-            writer.write_all(
-                coeff.into_uncompressed()
-                    .as_ref()
-            ).unwrap();
+            writer
+                .write_all(coeff.into_uncompressed().as_ref())
+                .unwrap();
         }
 
         // Lagrange coefficients in G2 (for precomputing
@@ -295,10 +275,9 @@ fn main() {
             // Was normalized earlier in parallel
             let coeff = coeff.into_affine();
 
-            writer.write_all(
-                coeff.into_uncompressed()
-                    .as_ref()
-            ).unwrap();
+            writer
+                .write_all(coeff.into_uncompressed().as_ref())
+                .unwrap();
         }
 
         // Lagrange coefficients in G1 with alpha (for
@@ -307,10 +286,9 @@ fn main() {
             // Was normalized earlier in parallel
             let coeff = coeff.into_affine();
 
-            writer.write_all(
-                coeff.into_uncompressed()
-                    .as_ref()
-            ).unwrap();
+            writer
+                .write_all(coeff.into_uncompressed().as_ref())
+                .unwrap();
         }
 
         // Lagrange coefficients in G1 with beta (for
@@ -319,10 +297,9 @@ fn main() {
             // Was normalized earlier in parallel
             let coeff = coeff.into_affine();
 
-            writer.write_all(
-                coeff.into_uncompressed()
-                    .as_ref()
-            ).unwrap();
+            writer
+                .write_all(coeff.into_uncompressed().as_ref())
+                .unwrap();
         }
 
         // Bases for H polynomial computation
@@ -330,10 +307,9 @@ fn main() {
             // Was normalized earlier in parallel
             let coeff = coeff.into_affine();
 
-            writer.write_all(
-                coeff.into_uncompressed()
-                    .as_ref()
-            ).unwrap();
+            writer
+                .write_all(coeff.into_uncompressed().as_ref())
+                .unwrap();
         }
     }
 }
